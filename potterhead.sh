@@ -11,7 +11,7 @@ if [ ! -t 0 ]; then
     TMPFILE=$(mktemp /tmp/ph.XXXXXX.sh)
     cat > "$TMPFILE"
     chmod +x "$TMPFILE"
-    bash "$TMPFILE" "$@"
+    bash "$TMPFILE" "$@" < /dev/tty
     EXIT_CODE=$?
     rm -f "$TMPFILE" 2>/dev/null
     exit $EXIT_CODE
