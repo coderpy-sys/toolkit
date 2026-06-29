@@ -3,7 +3,20 @@
 #   ✦ POTTERHEAD SERVER TOOLKIT ✦
 #   Made with ♥ by @thatonepotterhead
 #   github.com/thatonepotterhead
+#   curl -fsSL https://get.goatdead.com | bash
 # ============================================================
+
+# ── Pipe detection: re-exec from temp file if stdin is a pipe ──
+if [ ! -t 0 ]; then
+    TMPFILE=$(mktemp /tmp/ph.XXXXXX.sh)
+    cat > "$TMPFILE"
+    chmod +x "$TMPFILE"
+    bash "$TMPFILE" "$@"
+    EXIT_CODE=$?
+    rm -f "$TMPFILE" 2>/dev/null
+    exit $EXIT_CODE
+fi
+
 set -uo pipefail
 
 # ── Colours & typography ────────────────────────────────────
@@ -33,6 +46,7 @@ brand() {
   echo '  ╚═╝      ╚═════╝    ╚═╝      ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═════╝ '
   echo -e "${NC}"
   echo -e "  ${DIM}Server Toolkit  •  Made with ♥ by ${W}@thatonepotterhead${NC}"
+  echo -e "  ${DIM}Run:  ${C}curl -fsSL https://get.goatdead.com | bash${NC}"
   echo
 }
 
@@ -384,8 +398,7 @@ install_convoy() {
 }
 
 # ════════════════════════════════════════════════════════════
-#  OPTION 4 — Fix Networking (reads current state, diagnoses,
-#              spins temp CT to test, then applies fix)
+#  OPTION 4 — Fix Networking
 # ════════════════════════════════════════════════════════════
 fix_networking() {
   brand
@@ -434,7 +447,7 @@ fix_networking() {
   echo -e "  ${W}ip_forward:${NC} $(cat /proc/sys/net/ipv4/ip_forward)"
   echo
 
-  # ── PHASE 2: Pick bridge to fix ──────────────────────────
+  # ── PHASE 2: Pick bridge ─────────────────────────────────
   hdr "Phase 2 — Select Bridge to Fix"
 
   if [[ ${#bridges[@]} -eq 0 ]]; then
@@ -461,7 +474,7 @@ fix_networking() {
   done
   ok "Selected: $sel_br"
 
-  # ── PHASE 3: Desired config for that bridge ───────────────
+  # ── PHASE 3: Desired config ──────────────────────────────
   hdr "Phase 3 — Desired Configuration for ${sel_br}"
 
   local cur_ip; cur_ip=$(ip -4 addr show "$sel_br" 2>/dev/null | awk '/inet /{print $2}' | head -1)
@@ -477,28 +490,24 @@ fix_networking() {
   local NEW_NET; NEW_NET=$(python3 -c "import ipaddress; n=ipaddress.ip_interface('${NEW_CIDR}'); print(str(n.network))" 2>/dev/null \
     || echo "$(echo "$NEW_IP" | awk -F'.' '{printf "%s.%s.%s",$1,$2,$3}').0/${NEW_PREFIX}")
 
-  # Only ask for gateway if it's vmbr0 (main bridge with upstream)
   local NEW_GW=""
   if [[ "$sel_br" == "vmbr0" ]]; then
     read -rp "  $(echo -e "${W}Gateway${NC} ${DIM}[${cur_gw}]${NC}: ")" NEW_GW_IN
     NEW_GW="${NEW_GW_IN:-$cur_gw}"
   fi
 
-  # NAT masquerade?
   local DO_NAT="no"
   if [[ "$sel_br" != "vmbr0" ]]; then
-    local nat_out="vmbr0"
-    read -rp "  $(echo -e "${W}Enable NAT masquerade → ${nat_out}?${NC} ${DIM}[Y/n]${NC}: ")" NAT_IN
+    read -rp "  $(echo -e "${W}Enable NAT masquerade → vmbr0?${NC} ${DIM}[Y/n]${NC}: ")" NAT_IN
     [[ "${NAT_IN,,}" =~ ^(y|yes|)$ ]] && DO_NAT="yes"
   fi
 
-  # ── PHASE 4: Spin up temp test CT ────────────────────────
+  # ── PHASE 4: Temp test CT ────────────────────────────────
   hdr "Phase 4 — Spinning Up Temp Test CT"
 
-  # Pick a test IP in the target subnet
   local TEST_HOST_OCTET=199
   local TEST_IP; TEST_IP=$(echo "$NEW_IP" | awk -F'.' "{printf \"%s.%s.%s.${TEST_HOST_OCTET}\",\$1,\$2,\$3}")
-  local TEST_GW="$NEW_IP"   # gateway = the bridge IP we're setting
+  local TEST_GW="$NEW_IP"
   local TEST_CIDR="${TEST_IP}/${NEW_PREFIX}"
 
   echo -e "  ${DIM}Test CT will use: ${W}${TEST_CIDR}${NC}  gw ${W}${TEST_GW}${NC}${NC}"
@@ -507,7 +516,6 @@ fix_networking() {
   local TEMP_ID; TEMP_ID=$(pick_ct_id 900)
   info "Temp CT ID: $TEMP_ID"
 
-  # Get or download a template
   local CT_STORAGE="local"
   local TEMPLATE
   TEMPLATE=$(pveam list "$CT_STORAGE" 2>/dev/null | awk '{print $1}' | grep -i 'debian-12-standard' | sort -V | tail -1 || true)
@@ -523,7 +531,6 @@ fix_networking() {
 
   local TEMP_PASS; TEMP_PASS=$(openssl rand -base64 12 | tr -d '=/+' | head -c 14)
 
-  # Apply the new IP to the bridge NOW (before creating CT) so it can reach the gateway
   info "Applying new IP to ${sel_br} for test..."
   ip addr flush dev "$sel_br" 2>/dev/null || true
   ip addr add "${NEW_CIDR}" dev "$sel_br" 2>/dev/null || true
@@ -536,7 +543,6 @@ fix_networking() {
     ok "NAT masquerade enabled for test"
   fi
 
-  # Create minimal temp CT
   pct create "$TEMP_ID" "$TEMPLATE" \
     --hostname "ph-nettest-${TEMP_ID}" \
     --cores 1 --memory 256 --swap 0 \
@@ -556,11 +562,16 @@ fix_networking() {
   local attempt
   for ((attempt=1; attempt<=20; attempt++)); do
     pct exec "$TEMP_ID" -- bash -c 'exit 0' &>/dev/null && break
-    sleep 2; ((attempt==20)) && { pct stop "$TEMP_ID" &>/dev/null; pct destroy "$TEMP_ID" --purge &>/dev/null; die "Temp CT failed to start"; }
+    sleep 2
+    ((attempt==20)) && {
+      pct stop "$TEMP_ID" &>/dev/null || true
+      pct destroy "$TEMP_ID" --purge &>/dev/null || true
+      die "Temp CT failed to start"
+    }
   done
   ok "Temp CT ${TEMP_ID} is up"
 
-  # ── PHASE 5: Run connectivity tests ──────────────────────
+  # ── PHASE 5: Tests ───────────────────────────────────────
   hdr "Phase 5 — Connectivity Tests"
 
   local TEST_PASS=0 TEST_FAIL=0
@@ -575,13 +586,12 @@ fix_networking() {
     fi
   }
 
-  run_test "Ping gateway (${TEST_GW})"          "ping -c 2 -W 3 ${TEST_GW}"
-  run_test "Ping Cloudflare DNS (1.1.1.1)"      "ping -c 2 -W 5 1.1.1.1"
-  run_test "Ping Google DNS (8.8.8.8)"           "ping -c 2 -W 5 8.8.8.8"
-  run_test "DNS resolution (google.com)"         "getent hosts google.com"
+  run_test "Ping gateway (${TEST_GW})"           "ping -c 2 -W 3 ${TEST_GW}"
+  run_test "Ping Cloudflare DNS (1.1.1.1)"       "ping -c 2 -W 5 1.1.1.1"
+  run_test "Ping Google DNS (8.8.8.8)"            "ping -c 2 -W 5 8.8.8.8"
+  run_test "DNS resolution (google.com)"          "getent hosts google.com"
   run_test "HTTP connectivity (curl ifconfig.me)" "curl -s --max-time 8 ifconfig.me"
 
-  # Get public IP from CT
   local CT_PUB_IP
   CT_PUB_IP=$(pct exec "$TEMP_ID" -- bash -c "curl -s --max-time 8 ifconfig.me" 2>/dev/null || echo "unreachable")
 
@@ -602,8 +612,8 @@ fix_networking() {
   hdr "Phase 7 — Apply Permanent Fix"
 
   if [[ $TEST_FAIL -gt 0 ]]; then
-    echo -e "  ${Y}${TEST_FAIL} test(s) failed.${NC} The bridge config may still work partially."
-    echo -e "  ${DIM}(Gateway ping failing is normal if this is a private NAT bridge with no upstream gateway)${NC}"
+    echo -e "  ${Y}${TEST_FAIL} test(s) failed.${NC} The config may still work partially."
+    echo -e "  ${DIM}(Gateway ping failing is normal for private NAT bridges)${NC}"
     echo
   fi
 
@@ -612,36 +622,30 @@ fix_networking() {
     ip addr flush dev "$sel_br" 2>/dev/null || true
     [[ -n "$cur_ip" ]] && ip addr add "$cur_ip" dev "$sel_br" 2>/dev/null || true
     [[ "$DO_NAT" == "yes" ]] && iptables -t nat -D POSTROUTING -s "${NEW_NET}" -o vmbr0 -j MASQUERADE 2>/dev/null || true
-    info "Reverted. No changes made to interfaces file."
+    info "Reverted. No changes made."
     pause; return
   }
 
-  # Write interfaces file
   local BACKUP="/etc/network/interfaces.fix.$(date +%s)"
   cp /etc/network/interfaces "$BACKUP"
   ok "Backup → $BACKUP"
 
-  # Rebuild interfaces file: keep everything except the stanza for sel_br, replace it
-  # Use python3 to do clean stanza replacement
   python3 - "$sel_br" "$NEW_CIDR" "$NEW_GW" "$DO_NAT" "$NEW_NET" << 'PYEOF'
 import sys, re
 
 bridge  = sys.argv[1]
-cidr    = sys.argv[2]   # e.g. 10.0.0.1/24
-gw      = sys.argv[3]   # "" for no gateway
-do_nat  = sys.argv[4]   # "yes"/"no"
-net     = sys.argv[5]   # e.g. 10.0.0.0/24
+cidr    = sys.argv[2]
+gw      = sys.argv[3]
+do_nat  = sys.argv[4]
+net     = sys.argv[5]
 
 with open('/etc/network/interfaces', 'r') as f:
     content = f.read()
 
-# Remove existing stanza for this bridge (auto + iface block)
 pattern = r'(?:^auto\s+{br}\s*\n)?(?:^iface\s+{br}\s+.*?)(?=^auto\s|\Z)'.format(br=re.escape(bridge))
 content = re.sub(pattern, '', content, flags=re.MULTILINE | re.DOTALL)
 content = content.rstrip('\n') + '\n'
 
-# Build replacement stanza
-ip_only = cidr.split('/')[0]
 nat_up   = f'    post-up   iptables -t nat -A POSTROUTING -s {net} -o vmbr0 -j MASQUERADE\n' if do_nat == 'yes' else ''
 nat_down = f'    post-down iptables -t nat -D POSTROUTING -s {net} -o vmbr0 -j MASQUERADE\n' if do_nat == 'yes' else ''
 gw_line  = f'    gateway {gw}\n' if gw else ''
@@ -664,12 +668,10 @@ PYEOF
 
   ok "/etc/network/interfaces updated"
 
-  # Persist ip_forward
   echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-potterhead.conf
   sysctl -p /etc/sysctl.d/99-potterhead.conf &>/dev/null
   ok "ip_forward=1 persisted"
 
-  # Persist iptables
   if [[ "$DO_NAT" == "yes" ]]; then
     if ! dpkg -l iptables-persistent &>/dev/null; then
       DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent &>/dev/null
@@ -678,7 +680,6 @@ PYEOF
     ok "iptables rules persisted"
   fi
 
-  # Reload networking
   ifreload -a 2>/dev/null || true
   ok "Network reloaded"
 
@@ -727,7 +728,10 @@ main_menu() {
       2) [[ $EUID -eq 0 ]] || die "Run as root"; setup_proxmox_network  ;;
       3) [[ $EUID -eq 0 ]] || die "Run as root"; install_convoy         ;;
       4) [[ $EUID -eq 0 ]] || die "Run as root"; fix_networking         ;;
-      q|Q|quit|exit) echo -e "\n  ${DIM}Made with ♥ by @thatonepotterhead${NC}\n"; exit 0 ;;
+      q|Q|quit|exit)
+        echo -e "\n  ${DIM}Made with ♥ by @thatonepotterhead${NC}"
+        echo -e "  ${DIM}curl -fsSL https://get.goatdead.com | bash${NC}\n"
+        exit 0 ;;
       *) warn "Invalid — enter 1, 2, 3, 4, or q"; sleep 1 ;;
     esac
   done
