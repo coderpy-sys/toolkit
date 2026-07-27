@@ -935,6 +935,309 @@ EOF
 }
 
 # ════════════════════════════════════════════════════════════
+#  OPTION 6 — Download VM Templates (Convoy images)
+# ════════════════════════════════════════════════════════════
+IMAGES_JSON_URL="https://images.cdn.convoypanel.com/images.json"
+DOWNLOADER_URL="https://github.com/ConvoyPanel/downloader/releases/latest/download/downloader_x86"
+
+# Patch a restored template conf: sata→scsi; non-Windows get cpu=host + vga=std
+patch_template_conf() {
+  local vmid="$1" name="$2"
+  local conf="/etc/pve/qemu-server/${vmid}.conf"
+  [[ -f "$conf" ]] || { warn "Config not found for VM ${vmid}"; return 1; }
+
+  # Disk + boot: sataN → scsiN (more widely supported)
+  sed -i -E \
+    -e 's/^sata([0-9]+):/scsi\1:/' \
+    -e 's/(boot:[[:space:]]*order=)sata([0-9]+)/\1scsi\2/g' \
+    -e 's/(order=[^[:space:]]*)sata([0-9]+)/\1scsi\2/g' \
+    "$conf"
+
+  # Ensure SCSI controller exists when we have scsi disks
+  if grep -qE '^scsi[0-9]+:' "$conf" && ! grep -qE '^scsihw:' "$conf"; then
+    echo "scsihw: virtio-scsi-single" >> "$conf"
+  fi
+
+  # Non-Windows: host CPU + Standard VGA
+  if [[ "${name,,}" != *windows* ]]; then
+    if grep -qE '^cpu:' "$conf"; then
+      sed -i -E 's/^cpu:.*/cpu: host/' "$conf"
+    else
+      echo "cpu: host" >> "$conf"
+    fi
+    if grep -qE '^vga:' "$conf"; then
+      sed -i -E 's/^vga:.*/vga: std/' "$conf"
+    else
+      echo "vga: std" >> "$conf"
+    fi
+  fi
+
+  ok "Patched ${vmid}.conf (${name})"
+}
+
+download_and_restore_template() {
+  local name="$1" vmid="$2" link="$3" storage="$4" tmp_dir="$5"
+  local conf="/etc/pve/qemu-server/${vmid}.conf"
+
+  if [[ -f "$conf" ]]; then
+    warn "${name}: VMID ${vmid} already exists — skipping"
+    return 0
+  fi
+
+  local ext="" fname
+  case "${link,,}" in
+    *.vma.zst) ext=".zst" ;;
+    *.vma.gz)  ext=".gz"  ;;
+    *.vma.lzo) ext=".lzo" ;;
+    *.vma)     ext=""     ;;
+    *)         ext=".zst" ;;
+  esac
+  fname="${tmp_dir}/vzdump-qemu-${vmid}.vma${ext}"
+
+  info "Downloading ${name} (VMID ${vmid})..."
+  if ! wget --show-progress -O "$fname" "$link" 2>&1; then
+    # Older wget may lack --show-progress
+    wget -O "$fname" "$link" || {
+      err "Failed to download ${name}"
+      rm -f "$fname"
+      return 1
+    }
+  fi
+  ok "Downloaded ${name}"
+
+  info "Restoring ${name} → storage ${storage}..."
+  if ! qmrestore "$fname" "$vmid" --storage "$storage"; then
+    err "qmrestore failed for ${name}"
+    rm -f "$fname"
+    return 1
+  fi
+  ok "Restored ${name} as VM ${vmid}"
+  rm -f "$fname"
+
+  patch_template_conf "$vmid" "$name"
+}
+
+install_vm_templates() {
+  brand
+  hdr "Option 6 — Download VM Templates"
+  echo -e "  Pulls Convoy Panel OS templates from ${W}images.cdn.convoypanel.com${NC}"
+  echo -e "  ${DIM}Then patches configs: sata→scsi; non-Windows → cpu=host + VGA std${NC}"
+  echo
+  command -v qm &>/dev/null || die "qm not found — run on Proxmox host"
+  command -v qmrestore &>/dev/null || die "qmrestore not found"
+  command -v python3 &>/dev/null || die "python3 required to parse images.json"
+  command -v wget &>/dev/null || apt-get install -y -qq wget &>/dev/null
+
+  hdr "Storage"
+  prompt "Storage volume for VM disks" "local-lvm"; local STORAGE="$REPLY"
+  pvesm status 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$STORAGE" \
+    || warn "Storage '${STORAGE}' not listed by pvesm — continuing anyway"
+
+  hdr "Fetching template list"
+  local JSON_TMP; JSON_TMP=$(mktemp /tmp/ph-images.XXXXXX.json)
+  if ! wget -q -O "$JSON_TMP" "$IMAGES_JSON_URL"; then
+    rm -f "$JSON_TMP"
+    die "Could not fetch ${IMAGES_JSON_URL}"
+  fi
+  ok "Loaded images.json"
+
+  # Flatten into TSV: index | group | name | vmid | link
+  local FLAT; FLAT=$(mktemp /tmp/ph-flat.XXXXXX.tsv)
+  python3 - "$JSON_TMP" "$FLAT" << 'PYEOF'
+import json, sys
+src, out = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    groups = json.load(f)
+idx = 1
+with open(out, "w") as o:
+    for g in groups:
+        for t in g.get("templates", []):
+            # TSV — link may contain no tabs
+            o.write(f"{idx}\t{g['name']}\t{t['name']}\t{t['vmid']}\t{t['link']}\n")
+            idx += 1
+print(idx - 1)
+PYEOF
+  local TOTAL; TOTAL=$(wc -l < "$FLAT" | tr -d ' ')
+  [[ "$TOTAL" -gt 0 ]] || { rm -f "$JSON_TMP" "$FLAT"; die "No templates in images.json"; }
+
+  # Build group list
+  local GROUPS=()
+  mapfile -t GROUPS < <(cut -f2 "$FLAT" | awk '!seen[$0]++')
+
+  echo
+  echo -e "  ${W}${BOLD}Available templates (${TOTAL})${NC}"; sep
+  local cur_group=""
+  while IFS=$'\t' read -r idx group name vmid link; do
+    if [[ "$group" != "$cur_group" ]]; then
+      cur_group="$group"
+      echo
+      echo -e "  ${C}${BOLD}${group}${NC}"
+    fi
+    local status=""
+    [[ -f "/etc/pve/qemu-server/${vmid}.conf" ]] && status=" ${Y}(exists)${NC}"
+    printf "  ${M}${BOLD}%3s${NC}  %-28s  VMID ${DIM}%s${NC}%b\n" "$idx" "$name" "$vmid" "$status"
+  done < "$FLAT"
+  echo
+
+  hdr "Selection"
+  echo -e "  ${M}${BOLD}  a${NC}  Install ${W}all${NC} templates"
+  echo -e "  ${M}${BOLD}  g${NC}  Install by ${W}OS group${NC} (Ubuntu, Debian, Windows, …)"
+  echo -e "  ${M}${BOLD}  s${NC}  Install ${W}specific${NC} templates (numbers)"
+  echo -e "  ${M}${BOLD}  d${NC}  Use official ${W}Convoy downloader${NC} binary (installs all, then patch)"
+  echo -e "  ${M}${BOLD}  q${NC}  Cancel"
+  echo
+  read -rp "  $(echo -e "${W}Choice${NC} ${DIM}[a/g/s/d/q]${NC}: ")" sel_mode < /dev/tty
+
+  local SELECTED=()  # lines of: name|vmid|link
+
+  case "${sel_mode,,}" in
+    a|all)
+      while IFS=$'\t' read -r idx group name vmid link; do
+        SELECTED+=("${name}|${vmid}|${link}")
+      done < "$FLAT"
+      ;;
+    g|group)
+      echo
+      local gi=1
+      for g in "${GROUPS[@]}"; do
+        echo -e "  ${M}${BOLD}  ${gi}${NC}  ${W}${g}${NC}"
+        ((gi++))
+      done
+      echo
+      prompt "Group number(s), comma-separated" "1"
+      local gsel="$REPLY"
+      local want_groups=()
+      IFS=',' read -ra gnums <<< "$gsel"
+      for gn in "${gnums[@]}"; do
+        gn=$(echo "$gn" | tr -d ' ')
+        [[ "$gn" =~ ^[0-9]+$ ]] || continue
+        (( gn >= 1 && gn <= ${#GROUPS[@]} )) || continue
+        want_groups+=("${GROUPS[$((gn-1))]}")
+      done
+      [[ ${#want_groups[@]} -gt 0 ]] || { rm -f "$JSON_TMP" "$FLAT"; info "No groups selected."; pause; return; }
+      while IFS=$'\t' read -r idx group name vmid link; do
+        for wg in "${want_groups[@]}"; do
+          if [[ "$group" == "$wg" ]]; then
+            SELECTED+=("${name}|${vmid}|${link}")
+            break
+          fi
+        done
+      done < "$FLAT"
+      ;;
+    s|specific)
+      echo
+      prompt "Template number(s), comma-separated (e.g. 1,3,7)" ""
+      local tsel="$REPLY"
+      [[ -n "$tsel" ]] || { rm -f "$JSON_TMP" "$FLAT"; info "Nothing selected."; pause; return; }
+      local want_idx=()
+      IFS=',' read -ra tnums <<< "$tsel"
+      for tn in "${tnums[@]}"; do
+        tn=$(echo "$tn" | tr -d ' ')
+        [[ "$tn" =~ ^[0-9]+$ ]] || continue
+        want_idx+=("$tn")
+      done
+      while IFS=$'\t' read -r idx group name vmid link; do
+        for wi in "${want_idx[@]}"; do
+          if [[ "$idx" == "$wi" ]]; then
+            SELECTED+=("${name}|${vmid}|${link}")
+            break
+          fi
+        done
+      done < "$FLAT"
+      ;;
+    d|downloader)
+      rm -f "$JSON_TMP" "$FLAT"
+      hdr "Official Convoy Downloader"
+      echo -e "  Downloads ${W}all${NC} templates via Convoy's binary, then we patch configs."
+      echo
+      confirm "Continue?" || { info "Aborted."; return; }
+
+      local DL_DIR; DL_DIR=$(mktemp -d /tmp/ph-dl.XXXXXX)
+      info "Fetching downloader_x86..."
+      wget -q -O "${DL_DIR}/downloader_x86" "$DOWNLOADER_URL" \
+        || { rm -rf "$DL_DIR"; die "Failed to download downloader_x86"; }
+      chmod +x "${DL_DIR}/downloader_x86"
+      ok "Downloader ready"
+
+      info "Running Convoy downloader (it will ask for storage)..."
+      echo -e "  ${DIM}Suggested storage: ${STORAGE}${NC}"
+      echo
+      # Interactive TTY — dialoguer needs a real terminal
+      ( cd "$DL_DIR" && ./downloader_x86 "$IMAGES_JSON_URL" ) < /dev/tty \
+        || warn "Downloader exited with errors — patching whatever was installed"
+
+      hdr "Patching installed template configs"
+      local JSON2; JSON2=$(mktemp /tmp/ph-images.XXXXXX.json)
+      wget -q -O "$JSON2" "$IMAGES_JSON_URL" || true
+      if [[ -s "$JSON2" ]]; then
+        local _plist; _plist=$(mktemp /tmp/ph-patch.XXXXXX.tsv)
+        python3 - "$JSON2" "$_plist" << 'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f, open(sys.argv[2], "w") as o:
+    for g in json.load(f):
+        for t in g.get("templates", []):
+            o.write(f"{t['name']}\t{t['vmid']}\n")
+PYEOF
+        while IFS=$'\t' read -r name vmid; do
+          [[ -f "/etc/pve/qemu-server/${vmid}.conf" ]] && patch_template_conf "$vmid" "$name"
+        done < "$_plist"
+        rm -f "$_plist"
+      fi
+      rm -f "$JSON2"
+      rm -rf "$DL_DIR"
+
+      echo
+      echo -e "  ${G}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+      echo -e "  ${G}${BOLD}║   VM templates installed + configs patched   ║${NC}"
+      echo -e "  ${G}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+      echo
+      pause
+      return
+      ;;
+    q|quit|*)
+      rm -f "$JSON_TMP" "$FLAT"
+      info "Cancelled."
+      pause
+      return
+      ;;
+  esac
+
+  rm -f "$JSON_TMP" "$FLAT"
+
+  [[ ${#SELECTED[@]} -gt 0 ]] || { info "Nothing to install."; pause; return; }
+
+  echo
+  echo -e "  ${W}${BOLD}Will install ${#SELECTED[@]} template(s) → ${STORAGE}${NC}"; sep
+  for item in "${SELECTED[@]}"; do
+    IFS='|' read -r n v _ <<< "$item"
+    echo -e "    ${C}${n}${NC}  ${DIM}(VMID ${v})${NC}"
+  done
+  echo
+  confirm "Download and restore these templates?" || { info "Aborted."; pause; return; }
+
+  local TMP_DIR; TMP_DIR=$(mktemp -d /tmp/ph-tmpl.XXXXXX)
+  local ok_cnt=0 fail_cnt=0
+  for item in "${SELECTED[@]}"; do
+    IFS='|' read -r name vmid link <<< "$item"
+    if download_and_restore_template "$name" "$vmid" "$link" "$STORAGE" "$TMP_DIR"; then
+      ok_cnt=$((ok_cnt + 1))
+    else
+      fail_cnt=$((fail_cnt + 1))
+    fi
+    echo
+  done
+  rm -rf "$TMP_DIR"
+
+  echo
+  echo -e "  ${G}${BOLD}╔══════════════════════════════════════════════╗${NC}"
+  printf   "  ${G}${BOLD}║  Done: %-5s ok  /  %-5s failed             ║${NC}\n" "$ok_cnt" "$fail_cnt"
+  echo -e "  ${G}${BOLD}║  Disks: sata→scsi  |  Linux: cpu=host,vga=std ║${NC}"
+  echo -e "  ${G}${BOLD}╚══════════════════════════════════════════════╝${NC}"
+  echo
+  pause
+}
+
+# ════════════════════════════════════════════════════════════
 #  MAIN MENU
 # ════════════════════════════════════════════════════════════
 main_menu() {
@@ -957,10 +1260,13 @@ main_menu() {
     echo -e "  ${M}${BOLD}  5${NC}  ${W}Install Discord Bot${NC}"
     echo -e "     ${DIM}Deploy Proxmox VPS Manager bot with your credentials${NC}"
     echo
+    echo -e "  ${M}${BOLD}  6${NC}  ${W}Download VM Templates${NC}"
+    echo -e "     ${DIM}Convoy OS images — pick all / by group / specific; auto-patch scsi + CPU${NC}"
+    echo
     echo -e "  ${M}${BOLD}  q${NC}  ${DIM}Quit${NC}"
     echo
     sep
-    read -rp "  $(echo -e "${W}Choice${NC} ${DIM}[1-5/q]${NC}: ")" choice < /dev/tty
+    read -rp "  $(echo -e "${W}Choice${NC} ${DIM}[1-6/q]${NC}: ")" choice < /dev/tty
     echo
     case "$choice" in
       1) [[ $EUID -eq 0 ]] || die "Run as root"; install_proxmox        ;;
@@ -968,11 +1274,12 @@ main_menu() {
       3) [[ $EUID -eq 0 ]] || die "Run as root"; install_convoy         ;;
       4) [[ $EUID -eq 0 ]] || die "Run as root"; fix_networking         ;;
       5) [[ $EUID -eq 0 ]] || die "Run as root"; install_discord_bot    ;;
+      6) [[ $EUID -eq 0 ]] || die "Run as root"; install_vm_templates   ;;
       q|Q|quit|exit)
         echo -e "\n  ${DIM}Made with ♥ by @thatonepotterhead${NC}"
         echo -e "  ${DIM}curl -fsSL https://get.goatdead.com | bash${NC}\n"
         exit 0 ;;
-      *) warn "Invalid — enter 1, 2, 3, 4, 5, or q"; sleep 1 ;;
+      *) warn "Invalid — enter 1–6 or q"; sleep 1 ;;
     esac
   done
 }
