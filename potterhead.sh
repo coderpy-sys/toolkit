@@ -938,7 +938,84 @@ EOF
 #  OPTION 6 — Download VM Templates (Convoy images)
 # ════════════════════════════════════════════════════════════
 IMAGES_JSON_URL="https://images.cdn.convoypanel.com/images.json"
-DOWNLOADER_URL="https://github.com/ConvoyPanel/downloader/releases/latest/download/downloader_x86"
+DOWNLOADER_SRC_URL="https://github.com/ConvoyPanel/downloader.git"
+
+# Resolve toolkit / script dir (works for curl|bash temp copies and git clones)
+toolkit_dir() {
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || here="$(pwd)"
+  echo "$here"
+}
+
+# Ensure Convoy downloader Rust source is present (vendored, sibling, or fresh clone)
+# Sets PH_DOWNLOADER_SRC to the source directory path.
+ensure_downloader_source() {
+  local base candidates=()
+  PH_DOWNLOADER_SRC=""
+  base="$(toolkit_dir)"
+  candidates+=(
+    "${base}/downloader"
+    "${base}/../downloader"
+    "/opt/potterhead/downloader"
+    "/root/toolkit/downloader"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -f "${c}/Cargo.toml" && -d "${c}/src" ]]; then
+      PH_DOWNLOADER_SRC="$c"
+      return 0
+    fi
+  done
+
+  local clone_dir="/tmp/ph-downloader-src"
+  rm -rf "$clone_dir"
+  info "Downloader source not found locally — cloning ${DOWNLOADER_SRC_URL}…"
+  command -v git &>/dev/null || apt-get install -y -qq git &>/dev/null
+  git clone --depth 1 "$DOWNLOADER_SRC_URL" "$clone_dir" \
+    || die "Failed to clone downloader source from GitHub"
+  PH_DOWNLOADER_SRC="$clone_dir"
+}
+
+# Build release binary from source (never uses downloader_x86 release artifact)
+# Sets PH_DOWNLOADER_BIN to the absolute path of the built binary.
+build_downloader_from_source() {
+  local src_dir="$1"
+  local bin="${src_dir}/target/release/downloader"
+  PH_DOWNLOADER_BIN=""
+
+  if [[ -x "$bin" ]]; then
+    ok "Using existing build: $bin"
+    PH_DOWNLOADER_BIN="$bin"
+    return 0
+  fi
+
+  hdr "Building Convoy downloader from source"
+  info "Source: ${src_dir}"
+  command -v curl &>/dev/null || apt-get install -y -qq curl build-essential pkg-config &>/dev/null
+  apt-get install -y -qq build-essential pkg-config libssl-dev 2>/dev/null || true
+
+  if ! command -v cargo &>/dev/null; then
+    info "Installing Rust (rustup)…"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+  # shellcheck disable=SC1091
+  [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+
+  (
+    cd "$src_dir"
+    if [[ -x ./build.sh ]]; then
+      bash ./build.sh
+    else
+      cargo build --release
+    fi
+  ) || die "cargo build failed"
+
+  [[ -x "$bin" ]] || die "Build succeeded but binary missing: $bin"
+  ok "Built ${bin}"
+  PH_DOWNLOADER_BIN="$bin"
+}
 
 # Patch a restored template conf: sata→scsi; non-Windows get cpu=host + vga=std
 patch_template_conf() {
@@ -995,14 +1072,20 @@ download_and_restore_template() {
   fname="${tmp_dir}/vzdump-qemu-${vmid}.vma${ext}"
 
   info "Downloading ${name} (VMID ${vmid})..."
-  if ! wget --show-progress -O "$fname" "$link" 2>&1; then
-    # Older wget may lack --show-progress
-    wget -O "$fname" "$link" || {
-      err "Failed to download ${name}"
-      rm -f "$fname"
+  local attempt=1 max_attempts=3
+  while true; do
+    if wget --show-progress -O "$fname" "$link" 2>&1 || wget -O "$fname" "$link"; then
+      break
+    fi
+    rm -f "$fname"
+    if (( attempt >= max_attempts )); then
+      err "Failed to download ${name} after ${max_attempts} attempts"
       return 1
-    }
-  fi
+    fi
+    warn "Download failed (attempt ${attempt}/${max_attempts}) — retrying…"
+    attempt=$((attempt + 1))
+    sleep "$attempt"
+  done
   ok "Downloaded ${name}"
 
   info "Restoring ${name} → storage ${storage}..."
@@ -1020,8 +1103,9 @@ download_and_restore_template() {
 install_vm_templates() {
   brand
   hdr "Option 6 — Download VM Templates"
-  echo -e "  Pulls Convoy Panel OS templates from ${W}images.cdn.convoypanel.com${NC}"
-  echo -e "  ${DIM}Then patches configs: sata→scsi; non-Windows → cpu=host + VGA std${NC}"
+  echo -e "  Pulls Convoy OS templates from ${W}images.cdn.convoypanel.com${NC} (.vma backups → qmrestore)"
+  echo -e "  ${DIM}Patches: sata→scsi; non-Windows → cpu=host + VGA std${NC}"
+  echo -e "  ${DIM}Option d builds the Rust downloader from source (no release binary).${NC}"
   echo
   command -v qm &>/dev/null || die "qm not found — run on Proxmox host"
   command -v qmrestore &>/dev/null || die "qmrestore not found"
@@ -1080,10 +1164,10 @@ PYEOF
   echo
 
   hdr "Selection"
-  echo -e "  ${M}${BOLD}  a${NC}  Install ${W}all${NC} templates"
+  echo -e "  ${M}${BOLD}  a${NC}  Install ${W}all${NC} templates (CDN backups → qmrestore)"
   echo -e "  ${M}${BOLD}  g${NC}  Install by ${W}OS group${NC} (Ubuntu, Debian, Windows, …)"
   echo -e "  ${M}${BOLD}  s${NC}  Install ${W}specific${NC} templates (numbers)"
-  echo -e "  ${M}${BOLD}  d${NC}  Use official ${W}Convoy downloader${NC} binary (installs all, then patch)"
+  echo -e "  ${M}${BOLD}  d${NC}  ${W}Build downloader from source${NC} + install all (no release binary)"
   echo -e "  ${M}${BOLD}  q${NC}  Cancel"
   echo
   read -rp "  $(echo -e "${W}Choice${NC} ${DIM}[a/g/s/d/q]${NC}: ")" sel_mode < /dev/tty
@@ -1145,25 +1229,30 @@ PYEOF
         done
       done < "$FLAT"
       ;;
-    d|downloader)
+    d|downloader|build)
       rm -f "$JSON_TMP" "$FLAT"
-      hdr "Official Convoy Downloader"
-      echo -e "  Downloads ${W}all${NC} templates via Convoy's binary, then we patch configs."
+      hdr "Build Convoy downloader from source"
+      echo -e "  Compiles the Rust downloader locally (vendored or git clone)."
+      echo -e "  ${DIM}Never downloads downloader_x86 from GitHub Releases.${NC}"
+      echo -e "  Then installs ${W}all${NC} templates from ${C}${IMAGES_JSON_URL}${NC} via qmrestore."
       echo
       confirm "Continue?" || { info "Aborted."; return; }
 
-      local DL_DIR; DL_DIR=$(mktemp -d /tmp/ph-dl.XXXXXX)
-      info "Fetching downloader_x86..."
-      wget -q -O "${DL_DIR}/downloader_x86" "$DOWNLOADER_URL" \
-        || { rm -rf "$DL_DIR"; die "Failed to download downloader_x86"; }
-      chmod +x "${DL_DIR}/downloader_x86"
-      ok "Downloader ready"
+      local SRC_DIR
+      ensure_downloader_source
+      SRC_DIR="$PH_DOWNLOADER_SRC"
+      ok "Source: ${SRC_DIR}"
 
-      info "Running Convoy downloader (it will ask for storage)..."
-      echo -e "  ${DIM}Suggested storage: ${STORAGE}${NC}"
+      build_downloader_from_source "$SRC_DIR"
+      local DL_BIN="$PH_DOWNLOADER_BIN"
+      [[ -x "$DL_BIN" ]] || die "Downloader binary not available"
+
+      info "Running built downloader (images.json → CDN .vma backups → qmrestore)…"
+      echo -e "  ${DIM}Storage: ${STORAGE}${NC}"
       echo
-      # Interactive TTY — dialoguer needs a real terminal
-      ( cd "$DL_DIR" && ./downloader_x86 "$IMAGES_JSON_URL" ) < /dev/tty \
+      # shellcheck disable=SC1091
+      [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+      CONVOY_STORAGE="$STORAGE" "$DL_BIN" --storage="$STORAGE" "$IMAGES_JSON_URL" < /dev/tty \
         || warn "Downloader exited with errors — patching whatever was installed"
 
       hdr "Patching installed template configs"
@@ -1184,11 +1273,10 @@ PYEOF
         rm -f "$_plist"
       fi
       rm -f "$JSON2"
-      rm -rf "$DL_DIR"
 
       echo
       echo -e "  ${G}${BOLD}╔══════════════════════════════════════════════╗${NC}"
-      echo -e "  ${G}${BOLD}║   VM templates installed + configs patched   ║${NC}"
+      echo -e "  ${G}${BOLD}║   Built from source + templates installed    ║${NC}"
       echo -e "  ${G}${BOLD}╚══════════════════════════════════════════════╝${NC}"
       echo
       pause
@@ -1261,7 +1349,7 @@ main_menu() {
     echo -e "     ${DIM}Deploy Proxmox VPS Manager bot with your credentials${NC}"
     echo
     echo -e "  ${M}${BOLD}  6${NC}  ${W}Download VM Templates${NC}"
-    echo -e "     ${DIM}Convoy OS images — pick all / by group / specific; auto-patch scsi + CPU${NC}"
+    echo -e "     ${DIM}images.json CDN → qmrestore; optional build-from-source downloader${NC}"
     echo
     echo -e "  ${M}${BOLD}  q${NC}  ${DIM}Quit${NC}"
     echo
